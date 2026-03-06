@@ -1,0 +1,19 @@
+services:
+  council:
+    build: .
+    ports:
+      - "3000:3000"
+    # Points the proxy at the Ollama container by its service name
+    command: ["node", "server.js", "--port", "3000", "--ollama", "http://ollama:11434"]
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

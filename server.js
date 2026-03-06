@@ -142,7 +142,7 @@ server.on('error', (e) => {
   process.exit(1);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, '0.0.0.0', () => {
   const bar = '─'.repeat(54);
   console.log(`\n┌${bar}┐`);
   console.log(`│        🏛  The Council — Proxy Server                 │`);
