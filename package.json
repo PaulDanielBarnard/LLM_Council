@@ -1,0 +1,19 @@
+{
+  "name": "llm-council",
+  "version": "1.0.0",
+  "description": "The Council — Ollama LLM Deliberation with PostgreSQL auto-save and web search",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --port 3000"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": ["ollama", "llm", "council", "deliberation"],
+  "author": "Your Name",
+  "license": "MIT"
+}

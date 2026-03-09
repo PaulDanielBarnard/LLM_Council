@@ -21,6 +21,7 @@ const https = require('https');
 const fs    = require('fs');
 const path  = require('path');
 const url   = require('url');
+const db    = require('./db');
 
 // ── CLI ───────────────────────────────────────────────────────
 function arg(flag, def) {
@@ -30,6 +31,15 @@ function arg(flag, def) {
 const PORT        = parseInt(arg('--port',   '3000'));
 const LOCAL_OLLAMA = arg('--ollama', 'http://localhost:11434').replace(/\/+$/, '');
 const HTML_FILE   = path.join(__dirname, 'ollama-council.html');
+
+// ── DATABASE ──────────────────────────────────────────────────
+let dbInitialized = false;
+try {
+  db.initialize();
+  dbInitialized = true;
+} catch (error) {
+  console.warn('⚠️  Database not available — running without persistence');
+}
 
 // ── PROXY ─────────────────────────────────────────────────────
 function proxy(targetBase, req, res) {
@@ -87,8 +97,116 @@ function proxy(targetBase, req, res) {
   req.pipe(upstream);
 }
 
+// ── API HELPERS ───────────────────────────────────────────────
+function parseJSONBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function respondJSON(res, statusCode, data) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'Content-Type, Authorization',
+    'access-control-allow-methods': 'GET, POST, OPTIONS, DELETE'
+  });
+  res.end(JSON.stringify(data));
+}
+
+// ── CONVERSATIONS API ─────────────────────────────────────────
+async function handleConversationsAPI(method, pathname, req, res) {
+  try {
+    if (!dbInitialized) {
+      return respondJSON(res, 503, { error: 'Database not available' });
+    }
+
+    if (method === 'GET') {
+      // GET /api/conversations → list all
+      if (pathname === '/api/conversations') {
+        const conversations = await db.listConversations(100);
+        return respondJSON(res, 200, conversations);
+      }
+
+      // GET /api/conversations/:id → load specific conversation
+      const match = pathname.match(/^\/api\/conversations\/([^\/]+)$/);
+      if (match) {
+        const conversation_id = match[1];
+        const conversation = await db.loadConversation(conversation_id);
+
+        if (conversation === null) {
+          return respondJSON(res, 404, { error: 'Conversation not found' });
+        }
+
+        return respondJSON(res, 200, conversation);
+      }
+
+    } else if (method === 'POST') {
+      // POST /api/conversations → create new
+      if (pathname === '/api/conversations') {
+        const body = await parseJSONBody(req);
+        const user_query = body.user_query;
+        const mode = body.mode || 'local';
+
+        if (!user_query) {
+          return respondJSON(res, 400, { error: 'user_query is required' });
+        }
+
+        const conversation = await db.createConversation(user_query, mode);
+        return respondJSON(res, 201, conversation);
+      }
+
+      // POST /api/conversations/:id/messages → save message
+      const match = pathname.match(/^\/api\/conversations\/([^\/]+)\/messages$/);
+      if (match) {
+        const conversation_id = match[1];
+        const body = await parseJSONBody(req);
+
+        const message_id = await db.saveMessage(
+          conversation_id,
+          body.role,
+          body.member_name,
+          body.model_id,
+          body.content
+        );
+
+        return respondJSON(res, 201, { message_id: message_id });
+      }
+
+    } else if (method === 'DELETE') {
+      // DELETE /api/conversations/:id → delete conversation
+      const match = pathname.match(/^\/api\/conversations\/([^\/]+)$/);
+      if (match) {
+        const conversation_id = match[1];
+        const result = await db.deleteConversation(conversation_id);
+
+        if (result.success) {
+          return respondJSON(res, 200, { success: true });
+        } else {
+          return respondJSON(res, 500, { error: result.error });
+        }
+      }
+    }
+
+    return respondJSON(res, 404, { error: 'Not found' });
+
+  } catch (error) {
+    console.error('Conversations API error:', error.message);
+    return respondJSON(res, 500, { error: 'Server error' });
+  }
+}
+
 // ── SERVER ────────────────────────────────────────────────────
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const { pathname } = url.parse(req.url);
 
   // CORS preflight
@@ -96,9 +214,14 @@ const server = http.createServer((req, res) => {
     res.writeHead(204, {
       'access-control-allow-origin':  '*',
       'access-control-allow-headers': 'Content-Type, Authorization',
-      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-methods': 'GET, POST, OPTIONS, DELETE',
     });
     return res.end();
+  }
+
+  // API routes
+  if (pathname.startsWith('/api/conversations')) {
+    return await handleConversationsAPI(req.method, pathname, req, res);
   }
 
   // Proxy routes

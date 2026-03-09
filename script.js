@@ -37,6 +37,7 @@ const MEMBER_COLORS = ['#6fa8d6','#d4a95a','#8fbb7e','#c47abc','#5fcfcf','#e0707
 ═══════════════════════════════════════════ */
 let memberCount = 0;
 let currentMode = 'local';
+let conversationId = null;  // Current conversation ID for auto-save
 
 /* ═══════════════════════════════════════════
    CONFIG IMPORT/EXPORT & LOCAL STORAGE
@@ -105,6 +106,7 @@ function init() {
   bindConnectionSaving();
   bindFileHandlers();
   pingOllama();
+  loadConversationHistory();  // Load conversation history on startup
 }
 
 /* ═══════════════════════════════════════════
@@ -360,6 +362,9 @@ async function runCouncil() {
   const runBtn = document.getElementById('run-btn');
   runBtn.disabled = true;
 
+  // Create conversation for auto-save
+  await createConversationOnServer(prompt, currentMode);
+
   const rounds   = parseInt(document.getElementById('rounds').value) || 1;
   const synthVal = document.getElementById('synthesize').value;
   const combiner = getCombiner();
@@ -394,6 +399,8 @@ async function runCouncil() {
         let text = '';
         try {
           text = await streamChat(m.model, msgs, t => { bodyEl.textContent = t; });
+          // Auto-save council response
+          await saveMessageToDatabase('council', m.name, m.model, text);
         } catch(e) {
           bodyEl.textContent = `[Error: ${e.message}]`;
           bodyEl.style.color = 'var(--red)';
@@ -442,6 +449,8 @@ async function runCouncil() {
           {role:'system', content: sys},
           {role:'user',   content:`The question:\n\n${prompt}\n\n${'─'.repeat(50)}\nCOUNCIL RESPONSES:\n\n${record}\n${'─'.repeat(50)}\n\nNow produce the combined best-answer.`}
         ], t => { bodyEl.textContent = t; });
+        // Auto-save combiner response
+        await saveMessageToDatabase('combiner', combiner.name, combiner.model, combinedText);
       } catch(e) {
         bodyEl.textContent = `[Error: ${e.message}]`;
         bodyEl.style.color = 'var(--red)';
@@ -479,6 +488,8 @@ async function runCouncil() {
             {role:'system', content:`You are ${sm.name}, synthesizing the council's deliberation. Identify key agreements, important tensions, and offer a balanced overall conclusion.`},
             {role:'user',   content:`Original question: ${prompt}\n\nCouncil deliberation:\n\n${allText}\n\nProvide a clear synthesis.`}
           ], t => { bodyEl.textContent = t; });
+          // Auto-save synthesis response
+          await saveMessageToDatabase('synthesis', sm.name, sm.model, synthText);
         } catch(e) {
           bodyEl.textContent = `[Error: ${e.message}]`;
           bodyEl.style.color = 'var(--red)';
@@ -531,10 +542,12 @@ async function runCouncil() {
       });
 
       try {
-        await streamChat(leader.model, [
+        const verdictText = await streamChat(leader.model, [
           {role:'system', content: leaderSys},
           {role:'user',   content: context}
         ], t => { bodyEl.textContent = t; });
+        // Auto-save leader verdict
+        await saveMessageToDatabase('verdict', leader.name, leader.model, verdictText);
       } catch(e) {
         bodyEl.textContent = `[Error: ${e.message}]`;
         bodyEl.style.color = 'var(--red)';
@@ -550,6 +563,183 @@ async function runCouncil() {
   }
 
   runBtn.disabled = false;
+}
+
+/* ═══════════════════════════════════════════
+   CONVERSATION HISTORY
+═══════════════════════════════════════════ */
+
+async function createConversationOnServer(user_query, mode) {
+  try {
+    const response = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_query: user_query, mode: mode })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const result = await response.json();
+    conversationId = result.id;
+    console.log('✅ Conversation created:', conversationId);
+    return result;
+  } catch (error) {
+    console.error('Create conversation error:', error.message);
+    // Fallback: generate local ID
+    conversationId = generateUUID();
+    return { id: conversationId, created_at: new Date().toISOString() };
+  }
+}
+
+async function saveMessageToDatabase(role, member_name, model_id, content) {
+  if (!conversationId) return;
+
+  try {
+    const response = await fetch(`/api/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        role: role,
+        member_name: member_name,
+        model_id: model_id,
+        content: content
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log('✅ Message saved:', result.message_id);
+  } catch (error) {
+    console.warn('⚠️  Database save failed:', error.message);
+    // Could implement localStorage fallback here
+  }
+}
+
+async function loadConversationHistory() {
+  try {
+    const response = await fetch('/api/conversations');
+
+    if (!response.ok) {
+      throw new Error('Failed to load conversations');
+    }
+
+    const conversations = await response.json();
+    displayConversationHistory(conversations);
+  } catch (error) {
+    console.warn('Load history error:', error.message);
+  }
+}
+
+function displayConversationHistory(conversations) {
+  const historyList = document.getElementById('history-list');
+  if (!historyList) return;
+
+  if (conversations.length === 0) {
+    historyList.innerHTML = '<p style="color:var(--muted);font-style:italic;">No conversations yet</p>';
+    return;
+  }
+
+  historyList.innerHTML = '';
+
+  conversations.forEach(conv => {
+    const item = document.createElement('div');
+    item.className = 'conversation-item';
+    item.innerHTML = `
+      <div class="conversation-title">${conv.title}</div>
+      <div class="conversation-date">${new Date(conv.created_at).toLocaleDateString()}</div>
+      <div class="conversation-actions">
+        <button onclick="loadConversation('${conv.id}')">Load</button>
+        <button onclick="deleteConversation('${conv.id}')">Delete</button>
+      </div>
+    `;
+    historyList.appendChild(item);
+  });
+}
+
+async function loadConversation(conversation_id) {
+  try {
+    const response = await fetch(`/api/conversations/${conversation_id}`);
+
+    if (!response.ok) {
+      throw new Error('Conversation not found');
+    }
+
+    const conversation = await response.json();
+
+    // Set the prompt
+    document.getElementById('prompt').value = conversation.user_query;
+
+    // Clear current output
+    clearOutput();
+
+    // Display all messages
+    conversation.messages.forEach(message => {
+      displayResponse(message.member_name, message.content, message.role);
+    });
+
+    conversationId = conversation_id;
+    setStatus('Conversation loaded');
+  } catch (error) {
+    console.error('Load conversation error:', error.message);
+    showError('Failed to load conversation');
+  }
+}
+
+async function deleteConversation(conversation_id) {
+  if (!confirm('Delete this conversation? This cannot be undone.')) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/conversations/${conversation_id}`, {
+      method: 'DELETE'
+    });
+
+    if (!response.ok) {
+      throw new Error('Delete failed');
+    }
+
+    console.log('✅ Conversation deleted');
+    loadConversationHistory();  // Refresh the list
+  } catch (error) {
+    console.error('Delete error:', error.message);
+    showError('Failed to delete conversation');
+  }
+}
+
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+function displayResponse(member_name, content, role = 'council') {
+  const output = document.getElementById('output');
+
+  const responseCard = document.createElement('div');
+  responseCard.className = `response-card role-${role}`;
+
+  const header = document.createElement('div');
+  header.className = 'response-header';
+  header.innerHTML = `<strong>${member_name}</strong>`;
+  responseCard.appendChild(header);
+
+  const contentDiv = document.createElement('div');
+  contentDiv.className = 'response-content';
+  contentDiv.textContent = content;  // Simple text for now
+  responseCard.appendChild(contentDiv);
+
+  output.appendChild(responseCard);
+
+  // Scroll to newest response
+  output.scrollTop = output.scrollHeight;
 }
 
 /* ═══════════════════════════════════════════
